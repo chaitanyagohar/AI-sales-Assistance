@@ -7,53 +7,29 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 );
 
-// High-value directories that contain rich contact info (Phone/Email)
-const DIRECTORY_DOMAINS = [
-  'justdial.com', '99acres.com', 'magicbricks.com', 
-  'housing.com', 'indiamart.com', 'propertywala.com'
-];
+// Regex patterns to find emails and Indian phone numbers
+const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const PHONE_REGEX = /(?:\+91|91|0)?[ -]*[6-9][0-9]{4}[ -]*[0-9]{5}/g;
 
-// 🛑 Expanded Junk Domains (Added cybo and amazonaws)
-const JUNK_DOMAINS = [
-  'glassdoor.com', 'glassdoor.co.in', 'ambitionbox.com', 'zaubacorp.com', 
-  'tofler.in', 'tradeindia.com', 'sulekha.com', 'google.com', 
-  'realestateindia.com', 'crunchbase.com', 'quikr.com', 'linkedin.com',
-  'dialme24.co.in', 'makaan.com', 'wikipedia.org', 'cybo.com', 'amazonaws.com',
-  'indiamart.com' // Moved IndiaMart to Junk if it's yielding bad profiles
-];
-
-function cleanDDGUrl(rawUrl) {
-  if (rawUrl.includes('uddg=')) {
-    try {
-      const urlObj = new URL(rawUrl);
-      const uddg = urlObj.searchParams.get('uddg');
-      if (uddg) return decodeURIComponent(uddg);
-    } catch(e) {}
-  }
-  return rawUrl;
-}
-
-function getDomain(urlString) {
-  try {
-    return new URL(urlString).hostname.replace('www.', '').toLowerCase();
-  } catch(e) {
-    return '';
-  }
-}
+// Domains to ignore so we don't accidentally scrape directories
+const IGNORED_DOMAINS = ['99acres', 'magicbricks', 'housing.com', 'justdial', 'indiamart', 'linkedin', 'facebook', 'zaubacorp', 'tofler'];
 
 async function enrichLeads() {
-  console.log("🚀 Starting Hybrid Enrichment Engine...");
+  console.log("🚀 Starting the Enrichment Engine...");
 
+  // 1. Fetch leads that need enrichment
   const { data: leads, error } = await supabase
     .from('leads')
     .select('*')
-    .in('status', ['New Lead', 'Missing Data'])
-    .limit(5);
+    .eq('email', 'Pending Verification') // Or whatever status you used
+    .limit(10); // Process 10 at a time to avoid getting blocked
 
   if (error || !leads || leads.length === 0) {
-    console.log("No leads require enrichment right now.");
+    console.log("✅ No pending leads found for enrichment.");
     return;
   }
+
+  console.log(`Found ${leads.length} leads to enrich. Booting browser...`);
 
   const browser = await puppeteer.launch({
     headless: 'new',
@@ -62,118 +38,81 @@ async function enrichLeads() {
 
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  
-  const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi;
-  const phoneRegex = /(?:\+91|0)?[ -]?\d{4,5}[ -]?\d{5,6}/g;
 
   for (const lead of leads) {
-    console.log(`\n🔍 Researching: ${lead.name}`);
-    
-    let targetUrl = null;
-    let isDirectory = false;
-    let foundEmail = null;
-    let foundPhone = lead.phone !== 'Extracted via Web' ? lead.phone : null;
-
-    const searchQuery = `"${lead.name}" real estate contact phone email`;
-    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchQuery)}`;
+    console.log(`\n🔍 Hunting contact info for: ${lead.name} (${lead.city})`);
     
     try {
-      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      // Use DuckDuckGo for searching because Google blocks bots aggressively
+      const searchQuery = encodeURIComponent(`${lead.name} real estate developer ${lead.city} official website contact`);
+      await page.goto(`https://html.duckduckgo.com/html/?q=${searchQuery}`, { waitUntil: 'domcontentloaded' });
       
-      const rawLinks = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('.result__url')).map(a => a.href || a.innerText.trim());
-      });
-
-      let candidateOfficialSite = null;
-      let candidateDirectorySite = null;
-
-      // Classify the search results
-      for (let rawLink of rawLinks) {
-     if (!rawLink.startsWith('http')) rawLink = 'https://' + rawLink;
-        const realLink = cleanDDGUrl(rawLink);
-        const domain = getDomain(realLink);
-        
-        // Anti-PDF and Junk Filter
-        if (!domain || realLink.toLowerCase().endsWith('.pdf') || JUNK_DOMAINS.some(d => domain.includes(d))) {
-          continue;
-        }
-        
-        if (!domain || JUNK_DOMAINS.some(d => domain.includes(d))) continue;
-
-        // Check if it is a useful directory vs standalone website
-        if (DIRECTORY_DOMAINS.some(d => domain.includes(d))) {
-          if (!candidateDirectorySite) candidateDirectorySite = realLink;
-        } else {
-          if (!candidateOfficialSite) candidateOfficialSite = realLink;
-        }
-      }
-
-      // Priority: 1. Official Standalone Website, 2. Reputable Directory Listing
-      if (candidateOfficialSite) {
-        targetUrl = candidateOfficialSite;
-        isDirectory = false;
-        console.log(`🌐 Discovered Standalone Website: ${targetUrl}`);
-      } else if (candidateDirectorySite) {
-        targetUrl = candidateDirectorySite;
-        isDirectory = true;
-        console.log(`📋 Found Directory Listing: ${targetUrl}`);
-      }
-
-      // Crawl the targeted URL to extract contact details
-      if (targetUrl) {
-        try {
-          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          const pageText = await page.evaluate(() => document.body.innerText);
-          
-          // Extract Email
-          const emails = pageText.match(emailRegex);
-          if (emails) {
-            const validEmails = emails.filter(e => 
-              !e.endsWith('.png') && !e.endsWith('.jpg') && 
-              !e.endsWith('.webp') && !e.includes('sentry') &&
-              !DIRECTORY_DOMAINS.some(d => e.includes(d)) // Ignore portal administrative emails
-            );
-            if (validEmails.length > 0) foundEmail = validEmails[0].toLowerCase();
+      // 2. Extract the best website URL
+      const bestUrl = await page.evaluate((ignored) => {
+        const links = Array.from(document.querySelectorAll('a.result__url'));
+        for (let link of links) {
+          const url = link.href.toLowerCase();
+          const isIgnored = ignored.some(domain => url.includes(domain));
+          if (!isIgnored && url.includes('http')) {
+            return link.href; // Return the first official-looking URL
           }
-
-          // Extract Phone Number
-          const phones = pageText.match(phoneRegex);
-          if (phones && !foundPhone) {
-            foundPhone = phones[0].trim();
-          }
-        } catch (crawlError) {
-          console.log(`⚠️ Could not crawl ${targetUrl}: ${crawlError.message}`);
         }
-      } else {
-        console.log(`❌ No usable website or directory listing found.`);
+        return null;
+      }, IGNORED_DOMAINS);
+
+      if (!bestUrl) {
+        console.log(`⚠️ No valid website found for ${lead.name}. Skipping...`);
+        await markAsEnriched(lead.id, 'Website Not Found', 'Website Not Found', null);
+        continue;
       }
 
-      // Determine website state for database & AI context
-      let websiteField = null;
-      if (targetUrl) {
-        websiteField = isDirectory ? `Portal Only (${getDomain(targetUrl)})` : targetUrl;
-      }
+      console.log(`🔗 Found website: ${bestUrl}. Scanning for details...`);
 
-      const updatePayload = {
-        website: websiteField,
-        email: foundEmail || 'Pending Verification',
-        phone: foundPhone || 'Unknown',
-        status: foundEmail ? 'Enriched - Ready' : 'Missing Data'
-      };
+      // 3. Visit their actual website
+      await page.goto(bestUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      
+      // Extract all text from the website body
+      const pageText = await page.evaluate(() => document.body.innerText);
 
-      if (foundEmail) console.log(`✅ Extracted Email: ${foundEmail}`);
-      if (foundPhone) console.log(`📞 Extracted Phone: ${foundPhone}`);
+      // 4. Run Regex to find emails and phones
+      const emails = [...new Set(pageText.match(EMAIL_REGEX) || [])];
+      let phones = [...new Set(pageText.match(PHONE_REGEX) || [])];
 
-      await supabase.from('leads').update(updatePayload).eq('id', lead.id);
-      await new Promise(r => setTimeout(r, 4000));
+      // Clean up phone formatting and filter out generic image sizes/pixels that match the regex
+      phones = phones.map(p => p.replace(/\D/g, '')).filter(p => p.length >= 10);
+
+      const finalEmail = emails.length > 0 ? emails[0].toLowerCase() : 'Not Found';
+      const finalPhone = phones.length > 0 ? phones[0] : 'Not Found';
+
+      console.log(`   📧 Email: ${finalEmail}`);
+      console.log(`   📱 Phone: ${finalPhone}`);
+
+      // 5. Update the Database
+      await markAsEnriched(lead.id, finalEmail, finalPhone, bestUrl);
 
     } catch (err) {
-      console.log(`⚠️ Enrichment failed for ${lead.name}: ${err.message}`);
+      console.log(`❌ Error enriching ${lead.name}: ${err.message}`);
     }
+
+    // Wait a few seconds between leads to act like a human
+    await new Promise(r => setTimeout(r, 4000));
   }
 
   await browser.close();
-  console.log('\n🎉 Finished Hybrid Discovery batch!');
+  console.log("\n🎉 Enrichment batch complete!");
+}
+
+// Helper function to update Supabase
+async function markAsEnriched(id, email, phone, website) {
+  await supabase
+    .from('leads')
+    .update({
+      email: email,
+      phone: phone,
+      website: website,
+      status: email !== 'Not Found' || phone !== 'Not Found' ? 'Enriched - Ready' : 'Enrichment Failed'
+    })
+    .eq('id', id);
 }
 
 enrichLeads();

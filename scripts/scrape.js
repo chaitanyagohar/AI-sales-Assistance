@@ -30,9 +30,16 @@ async function scrapeGoogleMaps() {
   const randomQuery = queries[Math.floor(Math.random() * queries.length)];
   console.log(`🚀 Starting scraper for query: "${randomQuery}"`);
 
+  // --- UPGRADE 1: Optimal 2026 Puppeteer Launch Settings ---
   const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    headless: 'shell', 
+    args: [
+      '--no-sandbox', 
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--window-size=1920,1080'
+    ]
   });
 
   const page = await browser.newPage();
@@ -59,7 +66,7 @@ async function scrapeGoogleMaps() {
       }
     });
 
-    // Extract listing names
+    // --- UPGRADE 2: Extract listing names AND scrape phone numbers using Regex ---
     const listings = await page.evaluate(() => {
       const items = Array.from(document.querySelectorAll('div[role="feed"] > div > div[jsaction]'));
       const results = [];
@@ -68,7 +75,19 @@ async function scrapeGoogleMaps() {
         const link = item.querySelector('a[href^="https://www.google.com/maps/place"]');
         if (link) {
           const name = link.getAttribute('aria-label');
-          if (name) results.push(name);
+          const cardText = item.innerText || "";
+          
+          // Regex to find standard Indian phone numbers
+          const phoneRegex = /(?:(?:\+|0{0,2})91(\s*[-]\s*)?|[0]?)?[6789]\d{9}/;
+          const phoneMatch = cardText.match(phoneRegex);
+          const rawPhone = phoneMatch ? phoneMatch[0].trim() : null;
+          
+          if (name) {
+            results.push({ 
+              name: name, 
+              phone: rawPhone 
+            });
+          }
         }
       });
       return results;
@@ -77,26 +96,28 @@ async function scrapeGoogleMaps() {
     console.log(`Found ${listings.length} total listings from Maps.`);
 
     let addedCount = 0;
-    for (const name of listings) {
+    for (const lead of listings) {
       // Check if lead already exists to prevent duplicate writes
       const { data: existing } = await supabase
         .from('leads')
         .select('id')
-        .eq('name', name);
+        .eq('name', lead.name);
 
       if (existing && existing.length > 0) continue;
 
+      // --- UPGRADE 3: Insert dynamic phone number instead of hardcoded string ---
       const { error } = await supabase.from('leads').insert([{
-        name: name,
+        name: lead.name,
         category: 'Real Estate Developer',
         status: 'New Lead',
         email: 'Pending Verification',
-        phone: 'Extracted via Web',
-        source: 'Google Maps'
+        phone: lead.phone, // Automatically maps to the scraped number or null
+        source: 'Google Maps',
+        city: city
       }]);
 
       if (!error) {
-        console.log(`✅ Saved new lead: ${name}`);
+        console.log(`✅ Saved new lead: ${lead.name} | Phone: ${lead.phone || 'None'}`);
         addedCount++;
       }
     }
